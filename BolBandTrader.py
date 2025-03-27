@@ -5,7 +5,7 @@ import tpqoa
 from datetime import datetime, timedelta, timezone
 import time
 
-class ConTrader(tpqoa.tpqoa):
+class BolBandTrader(tpqoa.tpqoa):
     def __init__(self, conf_file, instrument, bar_length, SMA, dev, units):
         super().__init__(conf_file)
         self.instrument = instrument
@@ -131,7 +131,7 @@ class ConTrader(tpqoa.tpqoa):
         print("{} | units = {} | price = {} | P&L = {} | Cum P&L = {}".format(time, units, price, pl, cumpl))
         print(100 * "-" + "\n")
 
-trader = ConTrader("oanda.cfg", "EUR_USD", bar_length= "1min", SMA = 20, dev = 1, units=100000)
+trader = BolBandTrader("oanda.cfg", "EUR_USD", bar_length= "1min", SMA = 20, dev = 1, units=100000)
 
 trader.get_most_recent()
 trader.stream_data(trader.instrument, stop=100)

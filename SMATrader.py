@@ -5,8 +5,8 @@ from datetime import datetime, timedelta, timezone
 import time
 import matplotlib.pyplot as plt
 
-class ConTrader(tpqoa.tpqoa):
-    def __init__(self, conf_file, instrument, bar_length, sma_short, sma_long, units,):
+class SMATrader(tpqoa.tpqoa):
+    def __init__(self, conf_file, instrument, bar_length, SMA_S, SMA_L, units,):
         super().__init__(conf_file)
         self.instrument = instrument
         self.bar_length = pd.to_timedelta(bar_length)
@@ -20,8 +20,8 @@ class ConTrader(tpqoa.tpqoa):
         self.profits = []
 
         #********************strategy specific attributes**********************#
-        self.sma_short = sma_short   # Short-term moving average (SMA 50)
-        self.sma_long = sma_long     # Long-term moving average (SMA 200)
+        self.SMA_S = SMA_S   # Short-term moving average (SMA 50)
+        self.SMA_L = SMA_L   # Long-term moving average (SMA 200)
         #**********************************************************************#
 
     def get_most_recent(self, days = 5):
@@ -70,8 +70,8 @@ class ConTrader(tpqoa.tpqoa):
         df = self.raw_data.copy()
 
         # ******************** SMA 50/200 Crossover Strategy ******************** #
-        df["SMA_S"] = df[self.instrument].rolling(self.sma_short).mean()
-        df["SMA_L"] = df[self.instrument].rolling(self.sma_long).mean()
+        df["SMA_S"] = df[self.instrument].rolling(self.SMA_S).mean()
+        df["SMA_L"] = df[self.instrument].rolling(self.SMA_L).mean()
         df["position"] = np.where(df["SMA_S"] > df["SMA_L"], 1, -1)
         # *********************************************************************** #
 
@@ -126,12 +126,15 @@ class ConTrader(tpqoa.tpqoa):
         print("{} | units = {} | price = {} | P&L = {} | Cum P&L = {}".format(time, units, price, pl, cumpl))
         print(100 * "-" + "\n")
 
-trader = ConTrader("oanda.cfg", "EUR_USD", bar_length= "1min", sma_short=50, sma_long = 200, units=100000)
+trader = SMATrader("oanda.cfg", "EUR_USD", bar_length= "1min", SMA_S=50, SMA_L=200, units=100000)
 
 trader.get_most_recent()
-trader.stream_data(trader.instrument, stop=100)
+trader.stream_data(trader.instrument, stop=200)
 if trader.position != 0:
     close_order = trader.create_order(trader.instrument, units = -trader.position * trader.total_units,
                                       suppress= True, ret= True)
     trader.report_trade(close_order, "GOING NEUTRAL")
     trader.position = 0
+
+trader.data.plot(figsize=(12, 8), secondary_y="position")
+plt.show()
