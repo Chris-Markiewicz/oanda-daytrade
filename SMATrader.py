@@ -3,9 +3,10 @@ import numpy as np
 import tpqoa
 from datetime import datetime, timedelta, timezone
 import time
+import matplotlib.pyplot as plt
 
 class ConTrader(tpqoa.tpqoa):
-    def __init__(self, conf_file, instrument, bar_length, window, units):
+    def __init__(self, conf_file, instrument, bar_length, sma_short, sma_long, units,):
         super().__init__(conf_file)
         self.instrument = instrument
         self.bar_length = pd.to_timedelta(bar_length)
@@ -19,7 +20,8 @@ class ConTrader(tpqoa.tpqoa):
         self.profits = []
 
         #********************strategy specific attributes**********************#
-        self.window = window         # General window size
+        self.sma_short = sma_short   # Short-term moving average (SMA 50)
+        self.sma_long = sma_long     # Long-term moving average (SMA 200)
         #**********************************************************************#
 
     def get_most_recent(self, days = 5):
@@ -44,7 +46,7 @@ class ConTrader(tpqoa.tpqoa):
             
     def on_success(self, time, bid, ask):
         print(self.ticks, end=" ", flush=True)
-        print(self.total_units)
+
 
         #collect and store tick data
         recent_tick = pd.to_datetime(time)
@@ -67,8 +69,11 @@ class ConTrader(tpqoa.tpqoa):
     def define_strategy(self):  # Strategy specific
         df = self.raw_data.copy()
 
-        df["returns"] = np.log(df[self.instrument] / df[self.instrument].shift())
-        df["position"] = -np.sign(df.returns.rolling(self.window).mean())
+        # ******************** SMA 50/200 Crossover Strategy ******************** #
+        df["SMA_S"] = df[self.instrument].rolling(self.sma_short).mean()
+        df["SMA_L"] = df[self.instrument].rolling(self.sma_long).mean()
+        df["position"] = np.where(df["SMA_S"] > df["SMA_L"], 1, -1)
+        # *********************************************************************** #
 
         self.data = df.copy()
 
@@ -121,7 +126,7 @@ class ConTrader(tpqoa.tpqoa):
         print("{} | units = {} | price = {} | P&L = {} | Cum P&L = {}".format(time, units, price, pl, cumpl))
         print(100 * "-" + "\n")
 
-trader = ConTrader("oanda.cfg", "EUR_USD", bar_length= "1min", window = 1, units=100000)
+trader = ConTrader("oanda.cfg", "EUR_USD", bar_length= "1min", sma_short=50, sma_long = 200, units=100000)
 
 trader.get_most_recent()
 trader.stream_data(trader.instrument, stop=100)

@@ -1,3 +1,4 @@
+from matplotlib import pyplot as plt
 import pandas as pd
 import numpy as np
 import tpqoa
@@ -5,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 import time
 
 class ConTrader(tpqoa.tpqoa):
-    def __init__(self, conf_file, instrument, bar_length, window, units):
+    def __init__(self, conf_file, instrument, bar_length, SMA, dev, units):
         super().__init__(conf_file)
         self.instrument = instrument
         self.bar_length = pd.to_timedelta(bar_length)
@@ -19,7 +20,8 @@ class ConTrader(tpqoa.tpqoa):
         self.profits = []
 
         #********************strategy specific attributes**********************#
-        self.window = window         # General window size
+        self.SMA = SMA
+        self.dev = dev
         #**********************************************************************#
 
     def get_most_recent(self, days = 5):
@@ -67,8 +69,16 @@ class ConTrader(tpqoa.tpqoa):
     def define_strategy(self):  # Strategy specific
         df = self.raw_data.copy()
 
-        df["returns"] = np.log(df[self.instrument] / df[self.instrument].shift())
-        df["position"] = -np.sign(df.returns.rolling(self.window).mean())
+        # ******************** Bollinger Bands Strategy ******************** #
+        df["SMA"] = df[self.instrument].rolling(self.SMA).mean()
+        df["Lower"] = df["SMA"] - df[self.instrument].rolling(self.SMA).std() * self.dev
+        df["Upper"] = df["SMA"] + df[self.instrument].rolling(self.SMA).std() * self.dev
+        df["distance"] = df[self.instrument] - df.SMA
+        df["position"] = np.where(df[self.instrument] < df.Lower, 1, np.nan)
+        df["position"] = np.where(df[self.instrument] > df.Upper, -1, df["position"])
+        df["position"] = np.where(df.distance * df.distance.shift(1) < 0, 0, df["position"])
+        df["position"] = df.position.ffill().fillna(0)
+        # ****************************************************************** #
 
         self.data = df.copy()
 
@@ -121,7 +131,7 @@ class ConTrader(tpqoa.tpqoa):
         print("{} | units = {} | price = {} | P&L = {} | Cum P&L = {}".format(time, units, price, pl, cumpl))
         print(100 * "-" + "\n")
 
-trader = ConTrader("oanda.cfg", "EUR_USD", bar_length= "1min", window = 1, units=100000)
+trader = ConTrader("oanda.cfg", "EUR_USD", bar_length= "1min", SMA = 20, dev = 1, units=100000)
 
 trader.get_most_recent()
 trader.stream_data(trader.instrument, stop=100)
@@ -130,3 +140,6 @@ if trader.position != 0:
                                       suppress= True, ret= True)
     trader.report_trade(close_order, "GOING NEUTRAL")
     trader.position = 0
+
+trader.data.tail(20)[["EUR_USD", "SMA", "Lower", "Upper"]].plot(figsize=(12,8))
+plt.show()
