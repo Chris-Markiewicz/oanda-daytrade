@@ -1,3 +1,4 @@
+
 import pandas as pd
 import numpy as np
 import tpqoa
@@ -124,7 +125,7 @@ class ConTrader(tpqoa.tpqoa):
 trader = ConTrader("oanda.cfg", "EUR_USD", bar_length= "1min", window = 1, units=100000)
 
 trader.get_most_recent()
-trader.stream_data(trader.instrument, stop=100)
+trader.stream_data(trader.instrument, stop=10)
 if trader.position != 0:
     close_order = trader.create_order(trader.instrument, units = -trader.position * trader.total_units,
                                       suppress= True, ret= True)

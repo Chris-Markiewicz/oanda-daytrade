@@ -73,8 +73,8 @@ class MLTrader(tpqoa.tpqoa):
         ''' Fetches historical data to bootstrap the model.
         '''
         print(f"Fetching most recent data for {self.instrument}...")
-        now = datetime.now(timezone.utc) - timedelta(days=end_offset_days)
-        now = now - timedelta(microseconds=now.microsecond)
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        now = now - timedelta(microseconds= now.microsecond)
         
         end_api = now 
         start_api = now - timedelta(days=days)
@@ -85,8 +85,8 @@ class MLTrader(tpqoa.tpqoa):
         print(f"Fetching data from {start_str} to {end_str} with granularity {granularity}")
 
         df = self.get_history(instrument=self.instrument,
-                              start=start_str,
-                              end=end_str,
+                              start=start_api,
+                              end=end_api,
                               granularity=granularity,
                               price="M",
                               localize=False) 
@@ -178,6 +178,8 @@ class MLTrader(tpqoa.tpqoa):
 
 
     def on_success(self, time_stamp, bid, ask, **kwargs):
+        print(self.ticks, end=" ", flush=True)
+
         recent_tick_time = pd.to_datetime(time_stamp)
         mid_price = (ask + bid) / 2
         new_tick_df = pd.DataFrame({self.instrument: mid_price}, index=[recent_tick_time])
@@ -280,22 +282,48 @@ class MLTrader(tpqoa.tpqoa):
             # Get current position details from OANDA
             oanda_pos_qty = 0
             oanda_pos_side = "NEUTRAL"
-            positions = self.get_positions()
+            positions = self.get_positions() # This method is part of tpqoa or your base class
+
             for pos_data in positions:
                 if pos_data['instrument'] == self.instrument:
-                    if int(pos_data['long']['units']) != 0:
-                        oanda_pos_qty = int(pos_data['long']['units'])
+                    long_units_str = pos_data.get('long', {}).get('units', '0') # More robust: handle missing 'long' key or 'units' key
+                    short_units_str = pos_data.get('short', {}).get('units', '0') # More robust: handle missing 'short' key or 'units' key
+
+                    # Convert to float first, then to int.
+                    # This handles cases like '0.0', '100.0', or even just '100'.
+                    try:
+                        long_units_val = int(float(long_units_str))
+                    except ValueError:
+                        print(f"Warning: Could not parse long units string '{long_units_str}' to float/int. Defaulting to 0.")
+                        long_units_val = 0
+                    
+                    try:
+                        short_units_val = int(float(short_units_str))
+                    except ValueError:
+                        print(f"Warning: Could not parse short units string '{short_units_str}' to float/int. Defaulting to 0.")
+                        short_units_val = 0
+
+                    if long_units_val != 0:
+                        oanda_pos_qty = long_units_val
                         oanda_pos_side = "LONG"
-                    elif int(pos_data['short']['units']) != 0:
-                        oanda_pos_qty = int(pos_data['short']['units']) # Will be negative
+                    elif short_units_val != 0:
+                        # OANDA short units are typically positive numbers representing the quantity short.
+                        # The 'short' part of the position data indicates the direction.
+                        # If your API returns them as negative, this is fine.
+                        # If they are positive, and you want oanda_pos_qty to be negative for shorts:
+                        oanda_pos_qty = -short_units_val # Or just short_units_val if they are already negative
                         oanda_pos_side = "SHORT"
-                    break
+                    break # Found instrument, no need to check other positions
             
             print(f"Balance: {balance} | P&L: {pl} | Unrealized P&L: {unrealized_pl} | "
                   f"OANDA {self.instrument} Pos: {oanda_pos_side} {oanda_pos_qty} | Internal Pos Tracker: {self.position}")
 
         except Exception as e:
-            print(f"Could not retrieve/parse account balance: {e}")
+            # Print the specific exception for better debugging
+            print(f"Could not retrieve/parse account balance: {type(e).__name__} - {e}")
+            # Optionally, print traceback for more detail:
+            # import traceback
+            # traceback.print_exc()
 
 
 # --- Example Usage ---
@@ -322,14 +350,14 @@ if __name__ == "__main__":
 
     # Fetch initial data. Model will be trained only if not loaded or force_retrain=True
     # Use force_retrain=True if you want to retrain even if a saved model exists
-    if not trader.get_most_recent(days=7, granularity="S5", end_offset_days=0, force_retrain=False):
+    if not trader.get_most_recent(days=120, granularity="S5", end_offset_days=0, force_retrain=False):
          print("Failed to initialize trader with historical data. Exiting.")
          exit()
 
     print("\n--- Starting Live Stream ---")
     try:
         # Stream for a number of ticks. For continuous, remove/increase stop.
-        trader.stream_data(trader.instrument, stop=500) # Stream for 500 ticks
+        trader.stream_data(trader.instrument, stop=100) # Stream for 500 ticks
         # For continuous streaming:
         # while True:
         #     trader.stream_data(trader.instrument, stop=1) # Process one tick
@@ -342,21 +370,88 @@ if __name__ == "__main__":
         print(f"\nAn error occurred during streaming: {e}")
     finally:
         print("\n--- Finalizing ---")
-        # Optional: Save model one last time if any online learning/adaptation was implemented (not in this version)
+        # Optional: Save model one last time
         # trader.save_model()
         
-        # Close any open position before exiting
-        current_trades = trader.get_trades()
-        for trade_info in current_trades:
-            if trade_info['instrument'] == trader.instrument and trade_info['currentUnits'] != '0':
-                units_to_close = -int(trade_info['currentUnits'])
-                print(f"Final Close: Closing {units_to_close} units of {trader.instrument} (Trade ID: {trade_info['id']})")
-                trader.close_trade(trade_info['id'], units=abs(units_to_close)) # OANDA API might expect positive units for closing
-                # Or, more simply, if you know your internal position:
-                # if trader.position == 1:
-                #     trader.create_order(trader.instrument, units=-trader.units)
-                # elif trader.position == -1:
-                #     trader.create_order(trader.instrument, units=trader.units)
+        print("Attempting to close any open position for", trader.instrument, "based on internal tracker.")
+        
+        closing_action_taken = False
+
+        if trader.position == 1: # Internally tracked as LONG
+            print(f"Internal state is LONG. Creating order to SELL {trader.units} {trader.instrument} to neutralize.")
+            try:
+                # Create an order to sell the units we think we are holding
+                # Set suppress=True to avoid the large printout
+                close_order_resp = trader.create_order(trader.instrument, units=-trader.units, suppress=True, ret=True)
+                if close_order_resp and 'id' in close_order_resp: # Check if response seems valid
+                    print(f"Offsetting SELL order placed/filled. Transaction ID (or similar): {close_order_resp.get('id', 'N/A')}, Reason: {close_order_resp.get('reason', 'N/A')}")
+                    closing_action_taken = True
+                elif close_order_resp:
+                    print(f"Offsetting SELL order response (unconfirmed structure): {close_order_resp}")
+                    closing_action_taken = True # Assume action if any response
+                else:
+                    print("Offsetting SELL order did not return a confirmation.")
+            except Exception as e_close:
+                print(f"Error creating offsetting SELL order: {e_close}")
+                import traceback
+                traceback.print_exc()
+
+        elif trader.position == -1: # Internally tracked as SHORT
+            print(f"Internal state is SHORT. Creating order to BUY {trader.units} {trader.instrument} to neutralize.")
+            try:
+                # Create an order to buy back the units we think we are short
+                # Set suppress=True to avoid the large printout
+                close_order_resp = trader.create_order(trader.instrument, units=trader.units, suppress=True, ret=True)
+                if close_order_resp and 'id' in close_order_resp: # Check if response seems valid
+                    print(f"Offsetting BUY order placed/filled. Transaction ID (or similar): {close_order_resp.get('id', 'N/A')}, Reason: {close_order_resp.get('reason', 'N/A')}")
+                    closing_action_taken = True
+                elif close_order_resp:
+                    print(f"Offsetting BUY order response (unconfirmed structure): {close_order_resp}")
+                    closing_action_taken = True # Assume action if any response
+                else:
+                    print("Offsetting BUY order did not return a confirmation.")
+            except Exception as e_close:
+                print(f"Error creating offsetting BUY order: {e_close}")
+                import traceback
+                traceback.print_exc()
+        else:
+            print(f"Internal state is NEUTRAL for {trader.instrument}. No cleanup order sent based on internal tracker.")
+            # Optional: Sanity Check for Neutral Position (as before)
+            try:
+                current_oanda_positions = trader.get_positions()
+                position_on_oanda_units = 0
+                position_on_oanda_instrument = None
+
+                for pos in current_oanda_positions:
+                    if pos.get('instrument') == trader.instrument:
+                        long_units = int(float(pos.get('long', {}).get('units', '0')))
+                        short_units = int(float(pos.get('short', {}).get('units', '0')))
+                        if long_units != 0:
+                            position_on_oanda_units = long_units
+                        elif short_units != 0:
+                            position_on_oanda_units = -short_units # OANDA short units are positive
+                        position_on_oanda_instrument = trader.instrument
+                        break
+                
+                if position_on_oanda_instrument and position_on_oanda_units != 0:
+                    print(f"Sanity Check: OANDA shows a position of {position_on_oanda_units} {trader.instrument} while internal tracker is neutral.")
+                    # print(f"Consider manually closing this discrepancy or adding auto-logic.")
+                    # Example auto-close:
+                    # print(f"Attempting to auto-close discrepancy: {-position_on_oanda_units} {trader.instrument}")
+                    # trader.create_order(trader.instrument, units=-position_on_oanda_units, suppress=True, ret=True)
+                    # closing_action_taken = True
+                elif not position_on_oanda_instrument :
+                     print(f"Sanity Check: Confirmed no open position for {trader.instrument} on OANDA.")
+
+
+            except Exception as e_get_pos:
+                print(f"Error during final sanity check with get_positions(): {e_get_pos}")
+
+        # Optional: Add a small delay if an action was taken to allow OANDA to update account summary
+        if closing_action_taken:
+            print("Waiting a moment for account state to update after closing action...")
+            time.sleep(3) # Adjust delay as needed, or remove if not necessary
+
         trader.position = 0 # Reset internal tracker
 
         trader.report_balance()
