@@ -1,41 +1,49 @@
+# MLTrader.py
+
 import pandas as pd
 import numpy as np
 import tpqoa
 from datetime import datetime, timedelta, timezone
 import time
-from sklearn.linear_model import LogisticRegression # Example model
-import pickle # Import pickle
-import os # To check if model file exists
+# from sklearn.linear_model import LogisticRegression # Only needed if used as a fallback template
+import pickle
+import os
 
 class MLTrader(tpqoa.tpqoa):
 
-    def __init__(self, conf_file, instrument, bar_length, model, lags, units, model_filename="trained_ml_model.pkl"): # Added model_filename
+    def __init__(self, conf_file, instrument, bar_length, lags, units, 
+                 model_filename="trained_ml_model.pkl", fallback_model_template=None): # Added fallback_model_template
         super().__init__(conf_file)
         self.instrument = instrument
         self.bar_length = pd.to_timedelta(bar_length)
-        self.tick_data = pd.DataFrame()
-        self.raw_data = None
-        self.data = None
-        self.last_bar_time = None
+        self.tick_data = pd.DataFrame() # For collecting current bar's ticks
+        self.raw_data = None # Stores all tick data received OR historical S5 data
+        self.data = None # Stores resampled bars (e.g., 1-min bars)
+        self.last_bar_time = None # Timestamp of the last fully formed bar in self.data
 
-        self.initial_model = model # Store the initial model instance type
-        self.model = None # Will be loaded or trained
+        self.model = None # Will be loaded
         self.lags = lags
         self.units = units
-        self.position = 0
-        self.model_filename = model_filename # Path to save/load the model
+        self.position = 0 # Internal position tracker: 0=neutral, 1=long, -1=short
+        
+        self.model_filename = model_filename
+        self.fallback_model_template = fallback_model_template # e.g., LogisticRegression()
 
+        # Feature columns must match those used in training
         self.feature_columns = [f'lag_{lag}' for lag in range(1, self.lags + 1)]
-        self.target_column = 'direction'
+        # self.target_column = 'direction' # Not needed for prediction part
 
         print(f"MLTrader initialized for {self.instrument} with {self.lags} lags, trading {self.units} units.")
-        self.load_model() # Try to load an existing model
+        self.load_model()
 
-    def _ensure_model_instance(self):
-        """Ensures self.model is an instance of the initial model type if not loaded."""
         if self.model is None:
-            print("No pre-trained model found or loaded. Initializing a new model instance.")
-            self.model = self.initial_model # Use the passed model type
+            print(f"CRITICAL: Model could not be loaded from {self.model_filename}.")
+            if self.fallback_model_template:
+                print("Initializing with untrained fallback model template. PREDICTIONS WILL LIKELY BE RANDOM/POOR.")
+                self.model = self.fallback_model_template
+            else:
+                print("No fallback model template provided. ML trading will likely fail.")
+                # Consider exiting or disabling ML predictions if model is crucial and not loaded.
 
     def load_model(self):
         """Loads the ML model from a file using pickle."""
@@ -44,20 +52,17 @@ class MLTrader(tpqoa.tpqoa):
                 with open(self.model_filename, 'rb') as f:
                     self.model = pickle.load(f)
                 print(f"Loaded pre-trained model from {self.model_filename}")
-                if not hasattr(self.model, 'predict'): # Basic check
-                    print(f"Warning: Loaded object from {self.model_filename} might not be a valid model. Re-initializing.")
-                    self.model = None # Invalidate if it's not a model
-                    self._ensure_model_instance()
+                if not hasattr(self.model, 'predict'):
+                    print(f"Warning: Loaded object from {self.model_filename} is not a valid model. Invalidating.")
+                    self.model = None
             except Exception as e:
-                print(f"Error loading model from {self.model_filename}: {e}. Will train a new one.")
-                self.model = None # Ensure model is None if loading fails
-                self._ensure_model_instance()
+                print(f"Error loading model from {self.model_filename}: {e}. Model not loaded.")
+                self.model = None
         else:
-            print(f"No pre-trained model file found at {self.model_filename}. A new model will be trained if data is provided.")
-            self._ensure_model_instance()
+            print(f"No pre-trained model file found at {self.model_filename}.")
+            self.model = None
 
-
-    def save_model(self):
+    def save_model(self): # Kept for completeness, but primary saving is in train_model.py
         """Saves the current ML model to a file using pickle."""
         if self.model is not None:
             try:
@@ -69,390 +74,333 @@ class MLTrader(tpqoa.tpqoa):
         else:
             print("No model instance to save.")
 
-    def get_most_recent(self, days=5, granularity="S5", end_offset_days=0, force_retrain=False): # Added force_retrain
-        ''' Fetches historical data to bootstrap the model.
+    def fetch_initial_data(self, days_for_features=2, granularity="S5"):
+        ''' 
+        Fetches a small amount of recent historical data to bootstrap features for live trading.
+        This does NOT train the model.
+        'days_for_features' should be enough to calculate all lags after resampling.
+        e.g., if bar_length is 1min and lags is 5, you need at least 5+ mins of data.
+        Fetching a couple of days of S5 data ensures enough history for resampling and lags.
         '''
-        print(f"Fetching most recent data for {self.instrument}...")
-        now = datetime.now(timezone.utc).replace(tzinfo=None)
-        now = now - timedelta(microseconds= now.microsecond)
-        
-        end_api = now 
-        start_api = now - timedelta(days=days)
-
-        end_str = end_api.strftime("%Y-%m-%dT%H:%M:%SZ")
-        start_str = start_api.strftime("%Y-%m-%dT%H:%M:%SZ")
-        
-        print(f"Fetching data from {start_str} to {end_str} with granularity {granularity}")
-
-        df = self.get_history(instrument=self.instrument,
-                              start=start_api,
-                              end=end_api,
-                              granularity=granularity,
-                              price="M",
-                              localize=False) 
-        
-        if df.empty:
-            print("No historical data fetched. Exiting.")
+        if self.model is None and self.fallback_model_template is None:
+            print("No model loaded and no fallback, cannot effectively use fetched data for ML. Skipping initial data fetch for ML.")
             return False
             
-        df = df.c.dropna().to_frame()
-        df.rename(columns={"c": self.instrument}, inplace=True)
+        print(f"Fetching initial data ({days_for_features} days of {granularity}) to generate latest features for {self.instrument}...")
         
-        self.raw_data = df.copy() 
-        resampled_data = self.raw_data.resample(self.bar_length, label="right").last().dropna()
+        # Fetch recent data
+        now_utc = datetime.now(timezone.utc)
+        end_api = now_utc - timedelta(microseconds=now_utc.microsecond) # Current time, truncated
+        start_api = end_api - timedelta(days=days_for_features)
         
-        if resampled_data.empty:
-            print(f"Not enough data to form bars of length {self.bar_length} after resampling.")
+        # Convert to string format expected by tpqoa's get_history if needed, or pass datetime objects
+        # tpqoa's get_history can handle datetime objects directly.
+
+        df_hist = self.get_history(instrument=self.instrument,
+                                   start=start_api,
+                                   end=end_api,
+                                   granularity=granularity,
+                                   price="M", # Mid prices
+                                   localize=False) 
+        
+        if df_hist.empty:
+            print(f"No historical data fetched for initial features. Columns: {df_hist.columns if not df_hist.empty else 'N/A'}")
+            return False
+        
+        # Store this S5 data as the base for raw_data if needed, or directly resample
+        # self.raw_data will accumulate live ticks later.
+        # For now, let's assume df_hist has 'c' column from get_history
+        price_col = 'c'
+        if price_col not in df_hist.columns:
+            if self.instrument in df_hist.columns: # Fallback like in ConTrader
+                price_col = self.instrument
+            else:
+                print(f"Price column ('c' or '{self.instrument}') not found in fetched historical data.")
+                return False
+
+        # This is the initial set of resampled bars
+        resampled_hist_data = df_hist[[price_col]].resample(self.bar_length, label="right").last()
+        resampled_hist_data.rename(columns={price_col: self.instrument}, inplace=True)
+        resampled_hist_data.dropna(inplace=True)
+
+        if resampled_hist_data.empty:
+            print(f"Not enough historical data to form bars of length {self.bar_length} after resampling.")
             return False
 
-        self.data = resampled_data
+        self.data = resampled_hist_data # This is our initial set of bars
         self.last_bar_time = self.data.index[-1]
-        print(f"Initial data fetched. Last bar time: {self.last_bar_time}")
-        print(f"Initial data shape: {self.data.shape}")
         
-        # Decide whether to train the model
-        if self.model is None or force_retrain or not os.path.exists(self.model_filename):
-            print("Training new model (or force_retrain is True, or no model loaded).")
-            self._ensure_model_instance() # Make sure self.model is an instance
-            self.fit_model()
-        elif self.model and os.path.exists(self.model_filename):
-             print("Using pre-loaded/existing model. Skipping initial training unless force_retrain=True.")
-        else: # Should not happen if load_model and _ensure_model_instance work correctly
-            print("Model state is unexpected. Initializing and training.")
-            self._ensure_model_instance()
-            self.fit_model()
+        # Initialize self.raw_data with the S5 data for continuity if on_success appends to it
+        # This part depends on how you want to manage raw S5 data vs live ticks
+        # For simplicity, let's assume on_success will build its own raw_data if it starts empty
+        # Or prime it:
+        self.raw_data = df_hist[[price_col]].rename(columns={price_col: self.instrument}) if not df_hist.empty else pd.DataFrame()
 
+
+        print(f"Initial data for features fetched. Last historical bar time: {self.last_bar_time}")
+        print(f"Shape of initial self.data: {self.data.shape}")
+        
+        # Prepare features on this historical data to ensure logic is fine (optional print)
+        # X_hist, _ = self.prepare_features(self.data)
+        # if not X_hist.empty:
+        #     print(f"Latest historical features prepared (for bar {self.data.index[-len(X_hist)-1]} predicting for {self.data.index[-len(X_hist)]}):\n{X_hist.tail(1)}")
+        
         return True
 
-    def prepare_features(self, data_df):
-        ''' Prepares features (lags) and target for the ML model. '''
-        if data_df is None or data_df.empty or self.instrument not in data_df.columns:
-            # print("Data not available or instrument column missing for feature preparation.")
+    def prepare_features(self, data_df_input):
+        ''' Prepares features (lags) from the input DataFrame.
+            Input DataFrame ('data_df_input') should have the instrument's price column.
+        '''
+        if data_df_input is None or data_df_input.empty or self.instrument not in data_df_input.columns:
             return pd.DataFrame(), pd.Series() # Return empty to avoid downstream errors
 
-        df = data_df.copy()
+        df = data_df_input.copy() # Work on a copy
         df['returns'] = np.log(df[self.instrument] / df[self.instrument].shift(1))
         
         for lag in range(1, self.lags + 1):
             df[f'lag_{lag}'] = df['returns'].shift(lag)
         
-        df[self.target_column] = np.where(df['returns'].shift(-1) > 0, 1, -1)
+        # For prediction, we don't need the target 'direction' column here.
+        # We only need the features for the *latest available complete bar* to predict the next.
         
-        df.dropna(inplace=True)
-        
-        if df.empty or not all(col in df.columns for col in self.feature_columns) or self.target_column not in df.columns:
-            # print("Not enough data to create features and target after dropping NaNs.")
-            return pd.DataFrame(), pd.Series() # Return empty
+        df_features_only = df[self.feature_columns].copy()
+        df_features_only.dropna(inplace=True) # Drop rows where any lag is NaN
             
-        X = df[self.feature_columns]
-        y = df[self.target_column]
-        return X, y
+        return df_features_only # Return only the feature DataFrame
 
-    def fit_model(self):
-        ''' Trains the ML model and saves it. '''
-        self._ensure_model_instance() # Ensure self.model is a valid model object
+    def on_success(self, time_stamp, bid, ask, **kwargs): # timestamp from OANDA is already datetime
+        # self.ticks is managed by parent tpqoa class
+        print(self.ticks, end=" ", flush=True) 
 
-        if self.data is None or self.data.empty:
-            print("No data available to train the model.")
-            return
-
-        print("Preparing features and training model...")
-        X, y = self.prepare_features(self.data)
+        recent_tick_time = pd.to_datetime(time_stamp) # Ensure it's pandas datetime
+        mid_price = (bid + ask) / 2.0
         
-        if X.empty or y.empty:
-            print("Feature or target data is empty. Cannot train model.")
-            return
-        
-        if len(np.unique(y)) < 2 :
-            print(f"Only one class ({np.unique(y)}) present in the target variable. Cannot train model.")
-            return
-
-        try:
-            self.model.fit(X, y)
-            print("Model training complete.")
-            if hasattr(self.model, 'coef_'):
-                print(f"Model coefficients: {self.model.coef_}")
-            self.save_model() # Save the trained model
-        except Exception as e:
-            print(f"Error during model training: {e}")
-
-
-    def on_success(self, time_stamp, bid, ask, **kwargs):
-        print(self.ticks, end=" ", flush=True)
-
-        recent_tick_time = pd.to_datetime(time_stamp)
-        mid_price = (ask + bid) / 2
         new_tick_df = pd.DataFrame({self.instrument: mid_price}, index=[recent_tick_time])
         
-        if self.raw_data is None:
+        # Accumulate raw S5 tick data (or whatever granularity the stream provides)
+        if self.raw_data is None or self.raw_data.empty:
             self.raw_data = new_tick_df
         else:
+            # Ensure consistent column name for concat if raw_data was from historical fetch
+            if self.instrument not in self.raw_data.columns and 'c' in self.raw_data.columns:
+                 self.raw_data.rename(columns={'c': self.instrument}, inplace=True)
             self.raw_data = pd.concat([self.raw_data, new_tick_df])
         
+        # Initialize last_bar_time from historical data if not already set by fetch_initial_data
+        # or if fetch_initial_data failed or was skipped.
         if self.last_bar_time is None:
-            potential_last_bar = self.raw_data.resample(self.bar_length, label="right").last().dropna()
-            if not potential_last_bar.empty:
-                self.last_bar_time = potential_last_bar.index[-1]
-                if self.data is None: self.data = potential_last_bar # Initialize self.data if first time
-                print(f"Fallback: Initialized last_bar_time to {self.last_bar_time}")
-            else:
-                return
+            if self.data is not None and not self.data.empty: # If self.data was populated by fetch_initial_data
+                 self.last_bar_time = self.data.index[-1]
+            else: # Try to resample current raw_data to see if we can form a bar
+                potential_bars = self.raw_data.resample(self.bar_length, label="right").last().dropna()
+                if not potential_bars.empty:
+                    if self.instrument not in potential_bars.columns and 'price' in potential_bars.columns:
+                         potential_bars.rename(columns={'price': self.instrument}, inplace=True)
 
+                    self.data = potential_bars # Initialize self.data
+                    self.last_bar_time = self.data.index[-1]
+                    print(f"\n[on_success] Initialized last_bar_time to {self.last_bar_time} from streaming data.")
+                else:
+                    # Not enough data yet to form even one bar from stream, wait for more ticks
+                    return 
+
+        # Check if a new bar of self.bar_length should be formed
         if recent_tick_time - self.last_bar_time >= self.bar_length:
             self.resample_and_trade()
 
     def resample_and_trade(self):
         if self.raw_data is None or self.raw_data.empty:
-            # print("No raw data to resample.") # Can be noisy
             return
 
-        # print(f"\nResampling data at {datetime.now(timezone.utc)}...") # Can be noisy
-        new_bars = self.raw_data.resample(self.bar_length, label='right').last().dropna()
+        # Resample all raw_data received so far to form bars
+        # This ensures self.data contains all historical and newly formed bars
+        newly_formed_bars = self.raw_data.resample(self.bar_length, label='right').last().dropna()
 
-        if new_bars.empty or new_bars.index[-1] <= self.last_bar_time:
+        if newly_formed_bars.empty or newly_formed_bars.index[-1] <= self.last_bar_time:
+            # No new complete bar formed yet, or no bar after the last known one
             return
 
-        self.data = new_bars # Update with all bars, not just the latest one from raw_data
-        newly_formed_bar_time = self.data.index[-1]
-        # print(f"New bar formed. Previous last_bar_time: {self.last_bar_time}, New last_bar_time: {newly_formed_bar_time}")
-        self.last_bar_time = newly_formed_bar_time
+        self.data = newly_formed_bars # Update self.data with all bars up to now
         
-        X_all, _ = self.prepare_features(self.data)
+        # Ensure the instrument column name is consistent
+        if self.instrument not in self.data.columns and 'price' in self.data.columns:
+            self.data.rename(columns={'price': self.instrument}, inplace=True)
+        elif self.instrument not in self.data.columns and 'c' in self.data.columns:
+            self.data.rename(columns={'c': self.instrument}, inplace=True)
+
+
+        new_bar_time = self.data.index[-1]
+        # print(f"\nNew bar formed. Previous: {self.last_bar_time}, Current: {new_bar_time}")
+        self.last_bar_time = new_bar_time
         
-        if X_all.empty:
-            # print("No features available after preparing for prediction.")
+        # Prepare features for all data up to the latest bar
+        # The last row of X_to_predict will have features for the latest completed bar
+        X_to_predict = self.prepare_features(self.data) 
+        
+        if X_to_predict.empty:
+            # print(f"Not enough data in self.data (len {len(self.data)}) to create features for prediction for bar {self.last_bar_time}.")
             return
 
-        current_features = X_all.iloc[-1:].copy()
+        # Get features for the latest bar for which we can make a prediction
+        current_features_for_prediction = X_to_predict.iloc[-1:] # Last row of features
         
-        if current_features.isnull().any().any():
-            print(f"Warning: Features for prediction contain NaNs for bar {self.last_bar_time}. Skipping prediction.")
+        if current_features_for_prediction.isnull().any().any():
+            print(f"Warning: Features for prediction contain NaNs for bar ending {self.last_bar_time}. Bar data:\n{self.data.tail(self.lags + 2)}\nFeatures:\n{current_features_for_prediction}. Skipping prediction.")
             return
 
-        # print(f"Features for prediction (bar ending {self.last_bar_time}):\n{current_features}")
         if self.model is None:
-            print("Model is not trained or loaded. Cannot predict.")
-            # Optionally, try to fit the model here if enough data has accumulated
-            # if len(self.data) > self.lags + 20 : # Heuristic: enough data to train
-            #    self.fit_model()
+            print("Model is not loaded. Cannot predict.")
             return
 
         try:
-            prediction = self.model.predict(current_features)[0]
-            print(f"Prediction for {self.instrument} @ {self.last_bar_time}: {'LONG' if prediction == 1 else 'SHORT'}")
+            # Predict for the NEXT bar's direction
+            prediction = self.model.predict(current_features_for_prediction)[0]
+            # The prediction is based on features from bar ending self.last_bar_time
+            # This prediction is for the move from self.last_bar_time to self.last_bar_time + self.bar_length
+            print(f"\nPrediction for {self.instrument} (bar ending {self.last_bar_time}, signal for next bar): {'LONG' if prediction == 1 else 'SHORT' if prediction == -1 else 'NEUTRAL'}")
             self.execute_trade_logic(prediction)
         except Exception as e:
             print(f"Error during prediction or trade execution: {e}")
+            import traceback
+            traceback.print_exc()
+
 
     def execute_trade_logic(self, prediction):
-        print(f"TradeLogic | Current Pos: {self.position}, Signal: {'L' if prediction == 1 else 'S'}, Units: {self.units}")
+        print(f"TradeLogic | Current Pos: {self.position}, Signal: {'L' if prediction == 1 else 'S' if prediction == -1 else 'N'}, Units: {self.units}")
 
-        if prediction == 1:
-            if self.position == 0:
+        if prediction == 1: # Signal to Go LONG
+            if self.position == 0: # If neutral, open long
                 print(f"Action: Go LONG {self.units} {self.instrument}")
                 self.create_order(self.instrument, units=self.units, suppress=True, ret=True)
                 self.position = 1
-            elif self.position == -1:
+            elif self.position == -1: # If short, close short and open long (reverse)
                 print(f"Action: Close SHORT, Go LONG {self.units} {self.instrument}")
-                self.create_order(self.instrument, units=self.units, suppress=True, ret=True) # Close short
-                self.create_order(self.instrument, units=self.units, suppress=True, ret=True) # Go long
+                # Order to close short position (amount is 2 * self.units if short units are -self.units)
+                # Or simply, an order of self.units closes a short of -self.units and opens a long of 0.
+                # Then another self.units order.
+                # Simpler: OANDA handles net positions. If short 10k, order for 20k long = net 10k long.
+                self.create_order(self.instrument, units=2 * self.units, suppress=True, ret=True)
                 self.position = 1
-            # else: print("Already LONG. Holding.")
-        elif prediction == -1:
-            if self.position == 0:
+            # else: print("Already LONG or no change in signal. Holding.")
+        elif prediction == -1: # Signal to Go SHORT
+            if self.position == 0: # If neutral, open short
                 print(f"Action: Go SHORT {-self.units} {self.instrument}")
                 self.create_order(self.instrument, units=-self.units, suppress=True, ret=True)
                 self.position = -1
-            elif self.position == 1:
+            elif self.position == 1: # If long, close long and open short (reverse)
                 print(f"Action: Close LONG, Go SHORT {-self.units} {self.instrument}")
-                self.create_order(self.instrument, units=-self.units, suppress=True, ret=True) # Close long
-                self.create_order(self.instrument, units=-self.units, suppress=True, ret=True) # Go short
+                self.create_order(self.instrument, units=-2 * self.units, suppress=True, ret=True)
                 self.position = -1
-            # else: print("Already SHORT. Holding.")
-        self.report_balance() # Report after potential trade
+            # else: print("Already SHORT or no change in signal. Holding.")
+        elif prediction == 0: # Signal to Go NEUTRAL (if your model predicts this)
+            if self.position == 1: # If long, close it
+                print(f"Action: Close LONG position")
+                self.create_order(self.instrument, units=-self.units, suppress=True, ret=True)
+                self.position = 0
+            elif self.position == -1: # If short, close it
+                print(f"Action: Close SHORT position")
+                self.create_order(self.instrument, units=self.units, suppress=True, ret=True)
+                self.position = 0
+            # else: print("Already NEUTRAL. Holding.")
+        
+        self.report_balance()
 
     def report_balance(self):
+        # ... (report_balance method remains the same as your previous working version) ...
         try:
-            # OANDA specific way to get balance and P&L
             summary = self.get_account_summary()
             balance = summary.get('balance', 'N/A')
-            pl = summary.get('pl', 'N/A') # Profit/Loss
+            pl = summary.get('pl', 'N/A') 
             unrealized_pl = summary.get('unrealizedPL', 'N/A')
             
-            # Get current position details from OANDA
             oanda_pos_qty = 0
             oanda_pos_side = "NEUTRAL"
-            positions = self.get_positions() # This method is part of tpqoa or your base class
+            positions = self.get_positions() 
 
             for pos_data in positions:
                 if pos_data['instrument'] == self.instrument:
-                    long_units_str = pos_data.get('long', {}).get('units', '0') # More robust: handle missing 'long' key or 'units' key
-                    short_units_str = pos_data.get('short', {}).get('units', '0') # More robust: handle missing 'short' key or 'units' key
-
-                    # Convert to float first, then to int.
-                    # This handles cases like '0.0', '100.0', or even just '100'.
-                    try:
-                        long_units_val = int(float(long_units_str))
-                    except ValueError:
-                        print(f"Warning: Could not parse long units string '{long_units_str}' to float/int. Defaulting to 0.")
-                        long_units_val = 0
-                    
-                    try:
-                        short_units_val = int(float(short_units_str))
-                    except ValueError:
-                        print(f"Warning: Could not parse short units string '{short_units_str}' to float/int. Defaulting to 0.")
-                        short_units_val = 0
+                    long_units_str = pos_data.get('long', {}).get('units', '0') 
+                    short_units_str = pos_data.get('short', {}).get('units', '0')
+                    try: long_units_val = int(float(long_units_str))
+                    except ValueError: long_units_val = 0
+                    try: short_units_val = int(float(short_units_str))
+                    except ValueError: short_units_val = 0
 
                     if long_units_val != 0:
                         oanda_pos_qty = long_units_val
                         oanda_pos_side = "LONG"
                     elif short_units_val != 0:
-                        # OANDA short units are typically positive numbers representing the quantity short.
-                        # The 'short' part of the position data indicates the direction.
-                        # If your API returns them as negative, this is fine.
-                        # If they are positive, and you want oanda_pos_qty to be negative for shorts:
-                        oanda_pos_qty = -short_units_val # Or just short_units_val if they are already negative
+                        oanda_pos_qty = -short_units_val 
                         oanda_pos_side = "SHORT"
-                    break # Found instrument, no need to check other positions
+                    break 
             
             print(f"Balance: {balance} | P&L: {pl} | Unrealized P&L: {unrealized_pl} | "
                   f"OANDA {self.instrument} Pos: {oanda_pos_side} {oanda_pos_qty} | Internal Pos Tracker: {self.position}")
-
         except Exception as e:
-            # Print the specific exception for better debugging
             print(f"Could not retrieve/parse account balance: {type(e).__name__} - {e}")
-            # Optionally, print traceback for more detail:
-            # import traceback
-            # traceback.print_exc()
 
 
 # --- Example Usage ---
 if __name__ == "__main__":
     conf_file = "oanda.cfg"
     instrument = "EUR_USD"
-    bar_length_live = "1min" # Changed to 1min for more frequent bars
-    lags = 5
-    units_to_trade = 10000 # Standard lot for forex example
-    model_save_file = f"ml_trader_model_{instrument.replace('_','')}_{bar_length_live}_{lags}lags.pkl"
+    bar_length_live = "1min"
+    lags_live = 5 # MUST MATCH THE LAGS THE MODEL WAS TRAINED WITH
+    units_to_trade = 10000 
+    
+    # IMPORTANT: Construct the model filename to match the one saved by train_model.py
+    # Example: Assuming LightGBM was chosen and saved with PnLSelect suffix
+    # You might need to make this more dynamic or configurable
+    chosen_model_type_from_training = "LightGBM" # Or "RandomForest", "LogisticRegression"
+    # Construct the filename based on how train_model.py saves it
+    # e.g., MODEL_FILENAME_PATTERN = f"ml_trader_model_TYPE_VecSharpe_{INSTRUMENT.replace('_','')}_1min_5lags_trained.pkl"
+    # model_save_file = f"ml_trader_model_{chosen_model_type_from_training}_VecSharpe_{instrument.replace('_','')}_{bar_length_live}_{lags_live}lags_trained.pkl"
+    # OR, if train_model.py saved as "ml_trader_model_LightGBM_PnLSelect_EURUSD_1min_5lags_trained.pkl"
+    model_save_file = f"ml_trader_model_{chosen_model_type_from_training}_PnLSelect_{instrument.replace('_','')}_{bar_length_live}_{lags_live}lags_trained.pkl"
+    print(f"Attempting to load model: {model_save_file}")
 
-    # Initialize the type of model you want to use
-    # This model instance itself won't be used if a saved one is loaded,
-    # but its type is needed if a new model has to be created.
-    logistic_model_template = LogisticRegression(C=1.0, solver='lbfgs', max_iter=1000, random_state=42)
+
+    # Fallback model template (optional, if you want the script to run even if model loading fails)
+    # from sklearn.linear_model import LogisticRegression
+    # fallback_template = LogisticRegression() # Untrained!
 
     trader = MLTrader(conf_file=conf_file,
                       instrument=instrument,
                       bar_length=bar_length_live,
-                      model=logistic_model_template, # Pass the model instance/type
-                      lags=lags,
+                      lags=lags_live,
                       units=units_to_trade,
-                      model_filename=model_save_file)
+                      model_filename=model_save_file,
+                      fallback_model_template=None) # Or fallback_template
 
-    # Fetch initial data. Model will be trained only if not loaded or force_retrain=True
-    # Use force_retrain=True if you want to retrain even if a saved model exists
-    if not trader.get_most_recent(days=120, granularity="S5", end_offset_days=0, force_retrain=False):
-         print("Failed to initialize trader with historical data. Exiting.")
-         exit()
+    # Fetch a small amount of initial data to bootstrap features for the first few predictions
+    # Adjust 'days_for_features' based on bar_length and lags. 2 days of S5 should be plenty for 1min bars.
+    if not trader.fetch_initial_data(days_for_features=2, granularity="S5"):
+         print("Failed to initialize trader with historical data for features. Live predictions might be delayed or inaccurate initially.")
+         # Decide if you want to exit or proceed cautiously
+         # exit() 
+
+    if trader.model is None:
+        print("CRITICAL: No ML model loaded, and no fallback. Trading cannot proceed. Exiting.")
+        exit()
 
     print("\n--- Starting Live Stream ---")
     try:
-        # Stream for a number of ticks. For continuous, remove/increase stop.
-        trader.stream_data(trader.instrument, stop=100) # Stream for 500 ticks
-        # For continuous streaming:
-        # while True:
-        #     trader.stream_data(trader.instrument, stop=1) # Process one tick
-        #     # time.sleep(0.1) # Optional small delay if needed, but on_success is event-driven
-        #     # trader.report_balance() # Reporting balance too frequently can be noisy / rate-limited
-
+        trader.stream_data(trader.instrument, stop=500) # Stream for 500 ticks for testing
     except KeyboardInterrupt:
         print("\nStreaming stopped by user.")
     except Exception as e:
         print(f"\nAn error occurred during streaming: {e}")
+        import traceback
+        traceback.print_exc()
     finally:
         print("\n--- Finalizing ---")
-        # Optional: Save model one last time
-        # trader.save_model()
-        
-        print("Attempting to close any open position for", trader.instrument, "based on internal tracker.")
-        
-        closing_action_taken = False
-
-        if trader.position == 1: # Internally tracked as LONG
-            print(f"Internal state is LONG. Creating order to SELL {trader.units} {trader.instrument} to neutralize.")
-            try:
-                # Create an order to sell the units we think we are holding
-                # Set suppress=True to avoid the large printout
-                close_order_resp = trader.create_order(trader.instrument, units=-trader.units, suppress=True, ret=True)
-                if close_order_resp and 'id' in close_order_resp: # Check if response seems valid
-                    print(f"Offsetting SELL order placed/filled. Transaction ID (or similar): {close_order_resp.get('id', 'N/A')}, Reason: {close_order_resp.get('reason', 'N/A')}")
-                    closing_action_taken = True
-                elif close_order_resp:
-                    print(f"Offsetting SELL order response (unconfirmed structure): {close_order_resp}")
-                    closing_action_taken = True # Assume action if any response
-                else:
-                    print("Offsetting SELL order did not return a confirmation.")
-            except Exception as e_close:
-                print(f"Error creating offsetting SELL order: {e_close}")
-                import traceback
-                traceback.print_exc()
-
-        elif trader.position == -1: # Internally tracked as SHORT
-            print(f"Internal state is SHORT. Creating order to BUY {trader.units} {trader.instrument} to neutralize.")
-            try:
-                # Create an order to buy back the units we think we are short
-                # Set suppress=True to avoid the large printout
-                close_order_resp = trader.create_order(trader.instrument, units=trader.units, suppress=True, ret=True)
-                if close_order_resp and 'id' in close_order_resp: # Check if response seems valid
-                    print(f"Offsetting BUY order placed/filled. Transaction ID (or similar): {close_order_resp.get('id', 'N/A')}, Reason: {close_order_resp.get('reason', 'N/A')}")
-                    closing_action_taken = True
-                elif close_order_resp:
-                    print(f"Offsetting BUY order response (unconfirmed structure): {close_order_resp}")
-                    closing_action_taken = True # Assume action if any response
-                else:
-                    print("Offsetting BUY order did not return a confirmation.")
-            except Exception as e_close:
-                print(f"Error creating offsetting BUY order: {e_close}")
-                import traceback
-                traceback.print_exc()
-        else:
-            print(f"Internal state is NEUTRAL for {trader.instrument}. No cleanup order sent based on internal tracker.")
-            # Optional: Sanity Check for Neutral Position (as before)
-            try:
-                current_oanda_positions = trader.get_positions()
-                position_on_oanda_units = 0
-                position_on_oanda_instrument = None
-
-                for pos in current_oanda_positions:
-                    if pos.get('instrument') == trader.instrument:
-                        long_units = int(float(pos.get('long', {}).get('units', '0')))
-                        short_units = int(float(pos.get('short', {}).get('units', '0')))
-                        if long_units != 0:
-                            position_on_oanda_units = long_units
-                        elif short_units != 0:
-                            position_on_oanda_units = -short_units # OANDA short units are positive
-                        position_on_oanda_instrument = trader.instrument
-                        break
-                
-                if position_on_oanda_instrument and position_on_oanda_units != 0:
-                    print(f"Sanity Check: OANDA shows a position of {position_on_oanda_units} {trader.instrument} while internal tracker is neutral.")
-                    # print(f"Consider manually closing this discrepancy or adding auto-logic.")
-                    # Example auto-close:
-                    # print(f"Attempting to auto-close discrepancy: {-position_on_oanda_units} {trader.instrument}")
-                    # trader.create_order(trader.instrument, units=-position_on_oanda_units, suppress=True, ret=True)
-                    # closing_action_taken = True
-                elif not position_on_oanda_instrument :
-                     print(f"Sanity Check: Confirmed no open position for {trader.instrument} on OANDA.")
-
-
-            except Exception as e_get_pos:
-                print(f"Error during final sanity check with get_positions(): {e_get_pos}")
-
-        # Optional: Add a small delay if an action was taken to allow OANDA to update account summary
-        if closing_action_taken:
-            print("Waiting a moment for account state to update after closing action...")
-            time.sleep(3) # Adjust delay as needed, or remove if not necessary
-
-        trader.position = 0 # Reset internal tracker
-
+        # Simplified closing logic based on internal position tracker
+        if trader.position == 1: # Was long
+            print(f"Final Close: Closing LONG position of {trader.units} {trader.instrument}.")
+            trader.create_order(trader.instrument, units=-trader.units, suppress=True, ret=True)
+        elif trader.position == -1: # Was short
+            print(f"Final Close: Closing SHORT position of {trader.units} {trader.instrument}.")
+            trader.create_order(trader.instrument, units=trader.units, suppress=True, ret=True)
+        trader.position = 0
         trader.report_balance()
         print("Trading session ended.")

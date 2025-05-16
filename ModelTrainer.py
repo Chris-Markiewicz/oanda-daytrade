@@ -1,264 +1,348 @@
-# train_model.py
+# ModelTrainer.py
 
 import pandas as pd
 import numpy as np
 import tpqoa # Your tpqoa.py should be accessible
 from datetime import datetime, timedelta, timezone
 import pickle
+
+# Model Imports
 from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import GridSearchCV, TimeSeriesSplit
-from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+from sklearn.ensemble import RandomForestClassifier
+import lightgbm as lgb
+
+# Sklearn utilities
+from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, f1_score
+
+# Plotting
 import matplotlib.pyplot as plt
-import seaborn as sns # For a prettier confusion matrix
+import seaborn as sns
+
+# Custom modules
+from VectorizedMetrics import calculate_vectorized_pnl_and_returns, calculate_sharpe_ratio, get_daily_returns_from_bar_returns # Ensure this file exists
+from VectorizedPerformanceCalculator import VectorizedPerformanceCalculator # Ensure this file exists
+
 
 # --- Configuration Parameters ---
 CONF_FILE = "oanda.cfg"
 INSTRUMENT = "EUR_USD"
-# Differentiate model name for GridSearch version
-MODEL_FILENAME = f"ml_trader_model_gs_{INSTRUMENT.replace('_','')}_1min_5lags_trained.pkl"
+MODEL_FILENAME_PATTERN = f"ml_trader_model_TYPE_VecSharpe_{INSTRUMENT.replace('_','')}_1min_5lags_trained.pkl"
 
 # Data Fetching Parameters
-DAYS_OF_DATA_TO_FETCH = 60 # Increased for more robust Train/Validation/Test
-END_OFFSET_DAYS = 1
-GRANULARITY_FETCH = "S5"
-BAR_LENGTH_MODEL = "1min"
+DAYS_OF_DATA_TO_FETCH = 252 # e.g., ~3 months. Adjust based on data availability and strategy horizon
+END_OFFSET_DAYS = 1        # Fetch data up to 1 day ago
+GRANULARITY_FETCH = "S5"   # Granularity to fetch from API
+BAR_LENGTH_MODEL = "1min"  # Granularity to resample to for model training
 
 # Model & Feature Parameters
 LAGS = 5
+CV_SPLITS_FOR_TUNING = 3   # Number of splits for TimeSeriesSplit during GridSearchCV (e.g., 3-5)
 
-# GridSearchCV Parameters
-CV_SPLITS = 5 # Number of splits for TimeSeriesSplit
+# Cost Parameters for VectorizedSharpeCalculator (examples, adjust to be realistic)
+SPREAD_COST_PCT = 0.0001 # e.g., 0.01% = 1 pip for EUR/USD if price is ~1.0000
+TRANSACTION_FEE_PCT = 0.00005 # e.g., 0.005% if applicable
 
-# --- Helper Functions (fetch_and_prepare_data, prepare_features_and_target - remain the same as before) ---
+# --- Helper Functions ---
 def fetch_and_prepare_data(conf_file, instrument, days_to_fetch, end_offset_days, granularity_fetch, bar_length_model):
-    """
-    Fetches historical data, resamples it, and calculates returns.
-    (Same as previous version)
-    """
     print(f"Initializing OANDA connection using {conf_file}...")
     api = tpqoa.tpqoa(conf_file)
 
     print(f"Fetching {days_to_fetch} days of {granularity_fetch} data for {instrument}, ending {end_offset_days} day(s) ago.")
-    
-    end_date = datetime.now(timezone.utc).replace(tzinfo=None)
+    end_date = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=end_offset_days)
     end_date = end_date - timedelta(microseconds= end_date.microsecond)
     start_date = end_date - timedelta(days=days_to_fetch)
 
     print(f"Calculated fetch period: Start={start_date.isoformat()}, End={end_date.isoformat()}")
-
     try:
-        raw_df = api.get_history(
-            instrument=instrument,
-            start=start_date,
-            end=end_date,
-            granularity=granularity_fetch,
-            price="M",
-            localize=False 
-        )
+        raw_df = api.get_history(instrument=instrument, start=start_date, end=end_date, granularity=granularity_fetch, price="M", localize=False)
     except Exception as e:
-        print(f"Error fetching data from OANDA: {e}")
-        return None
-
-    if raw_df.empty:
-        print("No data fetched. Check parameters or API connection.")
-        return None
-
+        print(f"Error fetching data from OANDA: {e}"); return None
+    if raw_df.empty: print("No data fetched."); return None
+    
     print(f"Fetched {len(raw_df)} data points at {granularity_fetch} granularity.")
     
-    if 'c' not in raw_df.columns:
-        print("Error: 'c' (close) column not found in fetched data. Columns are:", raw_df.columns)
-        if instrument in raw_df.columns:
-            price_col_for_resample = instrument
-        else:
-            return None
-    else:
+    # Determine price column for resampling (prefer 'c', fallback to instrument name)
+    price_col_for_resample = None
+    if 'c' in raw_df.columns:
         price_col_for_resample = 'c'
+    elif instrument in raw_df.columns: # From ConTrader, 'c' is renamed to instrument
+        price_col_for_resample = instrument
+    
+    if price_col_for_resample is None: 
+        print(f"Price column ('c' or '{instrument}') not found in fetched data. Columns: {raw_df.columns}"); return None
 
     print(f"Resampling data to {bar_length_model} bars using column '{price_col_for_resample}'...")
-    resampled_data = raw_df[price_col_for_resample].resample(pd.to_timedelta(bar_length_model), label="right").last().to_frame()
-    resampled_data.rename(columns={price_col_for_resample: instrument}, inplace=True)
+    # Ensure the column exists before trying to resample it
+    if price_col_for_resample not in raw_df.columns:
+        print(f"Column '{price_col_for_resample}' does not exist in raw_df for resampling. Available: {raw_df.columns}"); return None
+
+    resampled_data = raw_df[[price_col_for_resample]].resample(pd.to_timedelta(bar_length_model), label="right").last()
+    resampled_data.rename(columns={price_col_for_resample: "price"}, inplace=True) # Standardize to 'price'
     resampled_data.dropna(inplace=True)
 
-    if resampled_data.empty:
-        print(f"No data after resampling to {bar_length_model}.")
-        return None
-
+    if resampled_data.empty: print(f"No data after resampling to {bar_length_model}."); return None
     print(f"Resampled to {len(resampled_data)} {bar_length_model} bars.")
     
-    resampled_data["returns"] = np.log(resampled_data[instrument] / resampled_data[instrument].shift(1))
+    resampled_data["returns"] = np.log(resampled_data["price"] / resampled_data["price"].shift(1))
     resampled_data.dropna(inplace=True)
     
-    return resampled_data
-
-def prepare_features_and_target(df, instrument_col, lags):
-    """
-    Prepares lagged return features and the target variable (direction of next return).
-    (Same as previous version)
-    """
-    data_ml = df.copy()
-    
+    # Add features directly to this DataFrame
     feature_columns = []
-    for lag in range(1, lags + 1):
+    for lag in range(1, LAGS + 1): # LAGS should be defined globally or passed
         col = f'lag_{lag}'
-        data_ml[col] = data_ml['returns'].shift(lag)
+        resampled_data[col] = resampled_data['returns'].shift(lag)
         feature_columns.append(col)
     
-    data_ml['direction'] = np.where(data_ml['returns'].shift(-1) > 0, 1, -1)
-    data_ml.dropna(inplace=True)
+    # Define target (direction)
+    resampled_data['direction'] = np.where(resampled_data['returns'].shift(-1) > 0, 1, -1)
     
-    if data_ml.empty:
-        print("Not enough data to create features and target after dropping NaNs.")
-        return None, None, None
+    resampled_data.dropna(inplace=True) # Drop NaNs from lags and direction shift
+    return resampled_data, feature_columns
 
-    X = data_ml[feature_columns]
-    y = data_ml['direction']
-    
-    return X, y, data_ml.index
 
 def plot_confusion_matrix(y_true, y_pred, classes, title='Confusion matrix', cmap=plt.cm.Blues):
-    """
-    This function prints and plots the confusion matrix.
-    """
     cm = confusion_matrix(y_true, y_pred)
     plt.figure(figsize=(8, 6))
     sns.heatmap(cm, annot=True, fmt="d", cmap=cmap, xticklabels=classes, yticklabels=classes)
     plt.title(title)
-    plt.ylabel('True label')
-    plt.xlabel('Predicted label')
-    plt.show()
+    plt.ylabel('True label'); plt.xlabel('Predicted label')
+    if plt.get_backend().lower() != 'agg' and (not plt.isinteractive() or 'inline' not in plt.get_backend().lower()):
+        plt.show(block=False) # Attempt non-blocking show for scripts
+        plt.pause(0.1) # Allow time for plot to render in some environments
+    else:
+        plt.show()
+
+
+def plot_equity_curves(model_equity_curve: pd.Series, 
+                       buy_and_hold_equity_curve: pd.Series, 
+                       model_name: str, 
+                       instrument: str,
+                       initial_capital: float):
+    """
+    Plots the equity curve of the model strategy against a Buy and Hold baseline.
+    """
+    plt.figure(figsize=(14, 7))
+    
+    # Normalize for comparison if starting points differ slightly due to initial trade, or plot raw
+    # Plotting raw equity curves directly
+    model_equity_curve.plot(label=f'{model_name} Strategy Equity')
+    buy_and_hold_equity_curve.plot(label='Buy and Hold Equity', linestyle='--')
+    
+    plt.title(f'Equity Curve: {model_name} vs. Buy and Hold for {instrument}')
+    plt.xlabel('Date')
+    plt.ylabel(f'Portfolio Value (Started with {initial_capital:,.0f})')
+    plt.legend()
+    plt.grid(True)
+    if plt.get_backend().lower() != 'agg' and (not plt.isinteractive() or 'inline' not in plt.get_backend().lower()):
+        plt.show(block=False)
+        plt.pause(0.1)
+    else:
+        plt.show()
 
 # --- Main Training Logic ---
 if __name__ == "__main__":
-    print("--- Starting Model Training Script with GridSearchCV ---")
+    print("--- Starting Model Training, Tuning (F1) & Selection (P&L/Sharpe) ---")
 
-    # 1. Fetch and Prepare Data
-    data = fetch_and_prepare_data(
-        conf_file=CONF_FILE,
-        instrument=INSTRUMENT,
-        days_to_fetch=DAYS_OF_DATA_TO_FETCH,
-        end_offset_days=END_OFFSET_DAYS,
-        granularity_fetch=GRANULARITY_FETCH,
-        bar_length_model=BAR_LENGTH_MODEL
+    INITIAL_CAPITAL_FOR_BACKTEST = 100000.0 # Define initial capital for backtests
+
+    # 1. Fetch and Prepare Data ('data_full_with_features' has price, returns, features, direction)
+    data_full_with_features, feature_names = fetch_and_prepare_data(
+        CONF_FILE, INSTRUMENT, DAYS_OF_DATA_TO_FETCH, END_OFFSET_DAYS, 
+        GRANULARITY_FETCH, BAR_LENGTH_MODEL
     )
+    if data_full_with_features is None: 
+        print("Failed to fetch or prepare data. Exiting.")
+        exit()
+    print(f"\nPrepared data for {INSTRUMENT} with {len(data_full_with_features)} bars. Features: {feature_names}")
 
-    if data is None:
-        print("Failed to fetch or prepare data. Exiting training script.")
+    # 2. Separate Features (X) and Target (y)
+    X = data_full_with_features[feature_names]
+    y = data_full_with_features['direction'].astype(int)
+    
+    if X.empty or y.empty: 
+        print("X or y is empty after feature prep. Exiting.")
+        exit()
+    unique_labels = sorted(list(y.unique()))
+    if len(unique_labels) < 2: 
+        print(f"Only one class ({unique_labels}) in target. Cannot train.")
+        exit()
+    print(f"Unique labels in y: {unique_labels}")
+
+    # 3. Split Data (Train for GS, Validation for P&L/Sharpe comparison, Test for final)
+    train_gs_ratio = 0.7 
+    validation_ratio = 0.15 
+    test_ratio = 0.15     
+
+    if not (abs(train_gs_ratio + validation_ratio + test_ratio - 1.0) < 1e-9 ):
+        print("Error: Train_GS, Validation, and Test ratios must sum to 1.0")
         exit()
 
-    print(f"\nPrepared data for {INSTRUMENT} with {len(data)} bars and 'returns' column.")
+    n_samples = len(X)
+    train_gs_end_idx = int(n_samples * train_gs_ratio)
+    val_end_idx = int(n_samples * (train_gs_ratio + validation_ratio))
 
-    # 2. Prepare Features and Target
-    X, y, index_ml = prepare_features_and_target(data, INSTRUMENT, LAGS)
+    X_train_gs, y_train_gs = X.iloc[:train_gs_end_idx], y.iloc[:train_gs_end_idx]
+    X_val, y_val = X.iloc[train_gs_end_idx:val_end_idx], y.iloc[train_gs_end_idx:val_end_idx]
+    X_test, y_test = X.iloc[val_end_idx:], y.iloc[val_end_idx:]
+    
+    print(f"\nData split:")
+    print(f"X_train_gs (for GridSearchCV): {X_train_gs.shape}")
+    print(f"X_val (for P&L/Sharpe model selection): {X_val.shape}")
+    print(f"X_test (final hold-out): {X_test.shape}")
 
-    if X is None or y is None:
-        print("Failed to prepare features/target. Exiting training script.")
+    if X_train_gs.empty or X_val.empty or X_test.empty: 
+        print("One or more data splits are empty.")
         exit()
 
-    print(f"\nCreated features (X shape: {X.shape}) and target (y shape: {y.shape}).")
-    
-    if len(np.unique(y)) < 2:
-        print(f"Only one class ({np.unique(y)}) present in the target variable. Cannot train model.")
-        exit()
-
-    # 3. Split Data (Chronologically for Time Series: Train + combined Validation/Test)
-    # GridSearchCV with TimeSeriesSplit will handle the "validation" part internally.
-    # We'll reserve a final test set that GridSearchCV never sees.
-    
-    # Total samples for training and internal validation by GridSearchCV
-    train_val_ratio = 0.8  # e.g., 80% for (training + CV for hyperparameter tuning)
-    test_ratio = 0.2       # e.g., 20% for final hold-out test set
-    
-    # Ensure there's enough data for at least CV_SPLITS in the training part
-    min_data_for_cv = CV_SPLITS * 20 # Heuristic: at least 20 samples per CV split
-    if len(X) * train_val_ratio < min_data_for_cv :
-        print(f"Warning: Not enough data for robust TimeSeriesSplit with {CV_SPLITS} splits. Consider fetching more data or reducing CV_SPLITS.")
-        # Adjust ratios or exit if too small
-        if len(X) < min_data_for_cv * 2: # Arbitrary threshold
-            print("Data too small for meaningful train/test split with CV. Exiting.")
-            exit()
-
-    split_index_for_test = int(len(X) * train_val_ratio)
-    
-    X_train_val = X.iloc[:split_index_for_test]
-    y_train_val = y.iloc[:split_index_for_test]
-    
-    X_test = X.iloc[split_index_for_test:]
-    y_test = y.iloc[split_index_for_test:]
-    index_test = index_ml[split_index_for_test:]
-
-    print(f"\nData split overview:")
-    print(f"X_train_val (for GridSearchCV) shape: {X_train_val.shape}, y_train_val shape: {y_train_val.shape}")
-    print(f"X_test (final hold-out) shape: {X_test.shape}, y_test shape: {y_test.shape}")
-
-    if X_train_val.empty or X_test.empty:
-        print("Training/validation or testing set is empty. Need more data or adjust split ratio.")
-        exit()
-
-    # 4. Setup GridSearchCV for Hyperparameter Tuning
-    print(f"\nSetting up GridSearchCV for Logistic Regression...")
-    
-    # Define the parameter grid for LogisticRegression
-    # 'C' is the inverse of regularization strength; smaller values specify stronger regularization.
-    # 'solver' options depend on the problem size and type.
-    param_grid = {
-        'C': [0.01, 0.1, 1, 10, 100],
-        'solver': ['liblinear', 'lbfgs'], # 'liblinear' is good for smaller datasets, 'lbfgs' is a common default
-        'class_weight': [None, 'balanced']
+    # 4. Define Models and Parameter Grids for GridSearchCV
+    models_param_grids = {
+        "LogisticRegression": {
+            'estimator': LogisticRegression(solver='liblinear', class_weight='balanced', max_iter=1000, random_state=42),
+            'params': {'C': [0.01, 0.1, 1, 10]}
+        },
+        "RandomForest": {
+            'estimator': RandomForestClassifier(class_weight='balanced', n_jobs=-1, random_state=42),
+            'params': {'n_estimators': [50, 100], 'max_depth': [10, 20], 'min_samples_leaf': [2, 5]}
+        },
+        "LightGBM": {
+            'estimator': lgb.LGBMClassifier(objective='binary', class_weight='balanced', verbose=-1, n_jobs=-1, random_state=42),
+            'params': {'n_estimators': [50, 100], 'learning_rate': [0.05, 0.1], 'num_leaves': [20, 31]}
+        }
     }
+    
+    print("\n--- Stage 1: Hyperparameter Tuning Models with GridSearchCV (using F1-score) ---")
+    tuned_models_after_gs = {}
+    
+    for model_name, config in models_param_grids.items():
+        print(f"\nTuning {model_name} with F1-score...")
+        tscv = TimeSeriesSplit(n_splits=CV_SPLITS_FOR_TUNING)
+        grid_search = GridSearchCV(estimator=config['estimator'],
+                                   param_grid=config['params'],
+                                   cv=tscv, scoring='f1', n_jobs=-1, verbose=0)
+        try:
+            grid_search.fit(X_train_gs, y_train_gs)
+            tuned_models_after_gs[model_name] = grid_search.best_estimator_
+            print(f"  Best F1 for {model_name} from GS: {grid_search.best_score_:.4f} with params: {grid_search.best_params_}")
+        except Exception as e:
+            print(f"  Error tuning {model_name}: {e}")
+            import traceback
+            traceback.print_exc()
 
-    # Initialize TimeSeriesSplit
-    # n_splits determines how many train/test iterations CV will do.
-    # The test set in each split will be chronologically after the train set.
-    tscv = TimeSeriesSplit(n_splits=CV_SPLITS)
-
-    # Initialize Logistic Regression model
-    log_reg = LogisticRegression(max_iter=1000, random_state=42)
-
-    # Initialize GridSearchCV
-    # Scoring can be 'accuracy', 'f1', 'roc_auc', etc. 'f1' is often good for imbalanced classes.
-    grid_search = GridSearchCV(estimator=log_reg, param_grid=param_grid, cv=tscv, scoring='f1', n_jobs=-1, verbose=1)
-    # n_jobs=-1 uses all available CPU cores
-    # verbose=1 shows some progress
-
-    print("Starting GridSearchCV... This may take a while.")
-    try:
-        grid_search.fit(X_train_val, y_train_val)
-    except Exception as e:
-        print(f"Error during GridSearchCV fitting: {e}")
+    if not tuned_models_after_gs: 
+        print("No models were successfully tuned. Exiting.")
         exit()
 
-    print("\nGridSearchCV finished.")
-    print(f"Best parameters found: {grid_search.best_params_}")
-    print(f"Best F1 score on validation sets: {grid_search.best_score_:.4f}")
-
-    # Get the best model found by GridSearchCV
-    best_model = grid_search.best_estimator_
-    if hasattr(best_model, 'coef_'):
-            print(f"Best model coefficients: {best_model.coef_}")
-
-
-    # 5. Evaluate the Best Model on the Hold-Out Test Set
-    print("\nEvaluating the best model on the hold-out test set...")
-    y_pred_test = best_model.predict(X_test)
+    # --- Stage 2: Evaluating Tuned Models on Validation Set for P&L and Sharpe Ratio ---
+    print("\n--- Stage 2: Evaluating Tuned Models on Validation Set for P&L and Sharpe Ratio ---")
+    validation_performance = {} 
     
-    test_accuracy = accuracy_score(y_test, y_pred_test)
-    test_report = classification_report(y_test, y_pred_test, target_names=['Down (-1)', 'Up (1)'], zero_division=0)
+    validation_data_for_calc = data_full_with_features.loc[X_val.index].copy()
+
+    for model_name, tuned_model_instance in tuned_models_after_gs.items():
+        print(f"\nCalculating performance for tuned {model_name} on Validation Set...")
+        
+        performance_calculator = VectorizedPerformanceCalculator(
+            symbol=INSTRUMENT,
+            ml_model=tuned_model_instance,
+            initial_capital=INITIAL_CAPITAL_FOR_BACKTEST, 
+            spread_cost_pct=SPREAD_COST_PCT,
+            transaction_fee_pct=TRANSACTION_FEE_PCT
+        )
+        
+        perf_metrics = performance_calculator.calculate_performance_metrics(
+            price_and_features_df=validation_data_for_calc, 
+            feature_columns=feature_names,
+            price_column_name='price'
+        )
+        validation_performance[model_name] = perf_metrics
+        print(f"  Tuned {model_name} - Validation P&L: {perf_metrics['pnl']:.2f}, Sharpe: {perf_metrics['sharpe']:.4f}")
+
+    valid_models_for_selection = {
+        name: metrics for name, metrics in validation_performance.items() 
+        if np.isfinite(metrics['pnl']) 
+    }
+    if not valid_models_for_selection:
+        print("No models yielded valid P&L on the validation set. Exiting.")
+        exit()
+        
+    best_model_name_after_val = max(valid_models_for_selection, key=lambda name: valid_models_for_selection[name]['pnl'])
+    overall_best_model = tuned_models_after_gs[best_model_name_after_val]
+    best_val_pnl = valid_models_for_selection[best_model_name_after_val]['pnl']
+    best_val_sharpe_for_display = valid_models_for_selection[best_model_name_after_val]['sharpe']
+        
+    print(f"\n--- Overall Best Model Selected (based on Validation Set P&L): {best_model_name_after_val} ---")
+    print(f"Best Validation Set P&L: {best_val_pnl:.2f} (Sharpe: {best_val_sharpe_for_display:.4f})")
+
+    # --- Stage 3: Final Evaluation of Overall Best Model on Test Set ---
+    print(f"\n--- Stage 3: Final Evaluation of {best_model_name_after_val} on Test Set ---")
     
-    print(f"\nHold-Out Test Set Accuracy: {test_accuracy:.4f}")
-    print("Hold-Out Test Set Classification Report:")
-    print(test_report)
+    test_data_for_calc = data_full_with_features.loc[X_test.index].copy()
 
-    # 6. Plot Confusion Matrix for the Test Set
-    print("\nPlotting Confusion Matrix for the Test Set...")
-    plot_confusion_matrix(y_test, y_pred_test, classes=['Down (-1)', 'Up (1)'], title='Confusion Matrix - Test Set')
+    final_performance_calculator = VectorizedPerformanceCalculator(
+        symbol=INSTRUMENT,
+        ml_model=overall_best_model,
+        initial_capital=INITIAL_CAPITAL_FOR_BACKTEST,
+        spread_cost_pct=SPREAD_COST_PCT,
+        transaction_fee_pct=TRANSACTION_FEE_PCT
+    )
+    final_perf_metrics_on_test = final_performance_calculator.calculate_performance_metrics(
+        price_and_features_df=test_data_for_calc,
+        feature_columns=feature_names,
+        price_column_name='price'
+    )
+    model_equity_curve_test = final_perf_metrics_on_test["equity_curve"]
+    print(f"Final {best_model_name_after_val} - Test Set P&L: {final_perf_metrics_on_test['pnl']:.2f}, Sharpe Ratio: {final_perf_metrics_on_test['sharpe']:.4f}")
 
-    # 7. Save the Best Trained Model
-    print(f"\nSaving the best trained model to {MODEL_FILENAME}...")
+    # Calculate Buy and Hold Equity Curve for the Test Set
+    test_set_prices = data_full_with_features.loc[X_test.index, 'price']
+    # Simple B&H: invest fully at the start, see value at the end.
+    # Or, if log returns were used for model equity, use log returns for B&H too.
+    buy_and_hold_returns_test = np.log(test_set_prices / test_set_prices.shift(1)).fillna(0)
+    buy_and_hold_cumulative_returns_test = buy_and_hold_returns_test.cumsum()
+    buy_and_hold_equity_test = INITIAL_CAPITAL_FOR_BACKTEST * np.exp(buy_and_hold_cumulative_returns_test)
+    buy_and_hold_equity_test.iloc[0] = INITIAL_CAPITAL_FOR_BACKTEST
+
+
+    print(f"\nFinal ML Metrics for {best_model_name_after_val} on Test Set:")
+    y_test_pred_final = overall_best_model.predict(X_test)
+    test_accuracy_final = accuracy_score(y_test, y_test_pred_final)
+    test_report_final = classification_report(y_test, y_test_pred_final, target_names=[str(l) for l in unique_labels], zero_division=0)
+    print(f"  Accuracy: {test_accuracy_final:.4f}")
+    print(f"  Classification Report:\n{test_report_final}")
+    
+    cm_classes = [str(l) for l in unique_labels]
+    # Plot Confusion Matrix (already defined)
+    print(f"\nPlotting Confusion Matrix for {best_model_name_after_val} on the Test Set...")
+    plot_confusion_matrix(y_test, y_test_pred_final, classes=cm_classes, 
+                          title=f'Confusion Matrix - {best_model_name_after_val} (Test Set)')
+
+    # Plot Equity Curves
+    if not model_equity_curve_test.empty and not buy_and_hold_equity_test.empty:
+        print(f"\nPlotting Equity Curves for {best_model_name_after_val} vs Buy & Hold on the Test Set...")
+        plot_equity_curves(
+            model_equity_curve=model_equity_curve_test,
+            buy_and_hold_equity_curve=buy_and_hold_equity_test,
+            model_name=best_model_name_after_val,
+            instrument=INSTRUMENT,
+            initial_capital=INITIAL_CAPITAL_FOR_BACKTEST
+        )
+    else:
+        print("Could not plot equity curves due to empty data.")
+
+
+    # Save the Overall Best Model
+    save_filename_final = MODEL_FILENAME_PATTERN.replace("TYPE", best_model_name_after_val.replace(" ", "_") + "_PnLSelect") # Filename reflects PnL selection
+    print(f"\nSaving the final best model ({best_model_name_after_val}) to {save_filename_final}...")
     try:
-        with open(MODEL_FILENAME, 'wb') as f:
-            pickle.dump(best_model, f)
-        print(f"Model successfully saved to {MODEL_FILENAME}")
-    except Exception as e:
+        with open(save_filename_final, 'wb') as f: 
+            pickle.dump(overall_best_model, f)
+        print(f"Model successfully saved to {save_filename_final}")
+    except Exception as e: 
         print(f"Error saving model: {e}")
 
-    print("\n--- Model Training Script Finished ---")
+    print("\n--- Model Training, Tuning & Selection Script Finished ---")
+    # Keep plots open if script finishes quickly and not in interactive mode
+    if plt.get_backend().lower() != 'agg' and (not plt.isinteractive() or 'inline' not in plt.get_backend().lower()):
+        print("\nDisplaying plots. Close plot windows to exit script if they don't close automatically.")
+        plt.show(block=True) # Block at the end to keep plots visible
