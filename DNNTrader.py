@@ -5,9 +5,13 @@ from datetime import datetime, timedelta, timezone
 import time
 import tensorflow as tf 
 import pickle           # For loading mu, std, and cols
+import logging
+import config
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 class DNNTrader(tpqoa.tpqoa):
-    def __init__(self, conf_file, instrument, bar_length, window, lags, model, mu, std, units):
+    def __init__(self, conf_file, instrument, bar_length, window, lags, model, mu, std, units, trained_cols, prob_threshold_lower=0.47, prob_threshold_upper=0.53):
         super().__init__(conf_file)
         self.instrument = instrument
         self.bar_length = pd.to_timedelta(bar_length)
@@ -25,12 +29,15 @@ class DNNTrader(tpqoa.tpqoa):
         self.model = model
         self.mu = mu
         self.std = std
+        self.trained_cols = trained_cols # Store the columns the model was trained on
+        self.prob_threshold_lower = prob_threshold_lower
+        self.prob_threshold_upper = prob_threshold_upper
         #************************************************************************
     
-    def get_most_recent(self, days = 5):
+    def get_most_recent(self, days = 10):
         while True:
             time.sleep(2)
-            now = datetime.now(timezone.utc).replace(tzinfo=None) # new (Python 3.12)
+            now = datetime.now(timezone.utc)
             now = now - timedelta(microseconds = now.microsecond)
             past = now - timedelta(days = days)
             df = self.get_history(instrument = self.instrument, start = past, end = now,
@@ -44,7 +51,7 @@ class DNNTrader(tpqoa.tpqoa):
                 break
                 
     def on_success(self, time, bid, ask):
-        print(self.ticks, end = " ", flush = True)
+        logging.info(f"Tick: {self.ticks}")
         
         recent_tick = pd.to_datetime(time)
         df = pd.DataFrame({self.instrument:(ask + bid)/2}, 
@@ -67,6 +74,7 @@ class DNNTrader(tpqoa.tpqoa):
         
         #******************** define your strategy here ************************
         #create features
+        # Note: Features for the current bar are calculated using the latest tick as the 'open' price.
         df = pd.concat([df, self.tick_data]) # append latest tick (== open price of current bar)
         df["returns"] = np.log(df[self.instrument] / df[self.instrument].shift())
         df["dir"] = np.where(df["returns"] > 0, 1, 0)
@@ -77,27 +85,33 @@ class DNNTrader(tpqoa.tpqoa):
         df["mom"] = df["returns"].rolling(3).mean()
         df["vol"] = df["returns"].rolling(self.window).std()
         df.dropna(inplace = True)
+        if df.empty:
+            print("Warning: DataFrame became empty after feature calculation and dropna. Skipping strategy definition.")
+            self.data = pd.DataFrame() # Ensure self.data is empty to prevent errors
+            return
         
         # create lags
-        self.cols = []
         features = ["dir", "sma", "boll", "min", "max", "mom", "vol"]
 
         for f in features:
             for lag in range(1, self.lags + 1):
                 col = "{}_lag_{}".format(f, lag)
                 df[col] = df[f].shift(lag)
-                self.cols.append(col)
         df.dropna(inplace = True)
+        if df.empty:
+            print("Warning: DataFrame became empty after lag creation and dropna. Skipping strategy definition.")
+            self.data = pd.DataFrame() # Ensure self.data is empty to prevent errors
+            return
         
         # standardization
         df_s = (df - self.mu) / self.std
         # predict
-        df["proba"] = self.model.predict(df_s[self.cols])
+        df["proba"] = self.model.predict(df_s[self.trained_cols])
         
         #determine positions
         df = df.loc[self.start_time:].copy() # starting with first live_stream bar (removing historical bars)
-        df["position"] = np.where(df.proba < 0.47, -1, np.nan)
-        df["position"] = np.where(df.proba > 0.53, 1, df.position)
+        df["position"] = np.where(df.proba < self.prob_threshold_lower, -1, np.nan)
+        df["position"] = np.where(df.proba > self.prob_threshold_upper, 1, df.position)
         df["position"] = df.position.ffill().fillna(0) # start with neutral position if no strong signal
         #***********************************************************************
         
@@ -106,27 +120,45 @@ class DNNTrader(tpqoa.tpqoa):
     def execute_trades(self):
         if self.data["position"].iloc[-1] == 1:
             if self.position == 0:
-                order = self.create_order(self.instrument, self.units, suppress = True, ret = True)
-                self.report_trade(order, "GOING LONG")
+                try:
+                    order = self.create_order(self.instrument, self.units, suppress = True, ret = True)
+                    self.report_trade(order, "GOING LONG")
+                except Exception as e:
+                    print(f"Error creating order (GOING LONG): {e}")
             elif self.position == -1:
-                order = self.create_order(self.instrument, self.units * 2, suppress = True, ret = True) 
-                self.report_trade(order, "GOING LONG")
+                try:
+                    order = self.create_order(self.instrument, self.units * 2, suppress = True, ret = True) 
+                    self.report_trade(order, "GOING LONG")
+                except Exception as e:
+                    print(f"Error creating order (GOING LONG, closing short): {e}")
             self.position = 1
         elif self.data["position"].iloc[-1] == -1: 
             if self.position == 0:
-                order = self.create_order(self.instrument, -self.units, suppress = True, ret = True)
-                self.report_trade(order, "GOING SHORT")
+                try:
+                    order = self.create_order(self.instrument, -self.units, suppress = True, ret = True)
+                    self.report_trade(order, "GOING SHORT")
+                except Exception as e:
+                    print(f"Error creating order (GOING SHORT): {e}")
             elif self.position == 1:
-                order = self.create_order(self.instrument, -self.units * 2, suppress = True, ret = True)
-                self.report_trade(order, "GOING SHORT")
+                try:
+                    order = self.create_order(self.instrument, -self.units * 2, suppress = True, ret = True)
+                    self.report_trade(order, "GOING SHORT")
+                except Exception as e:
+                    print(f"Error creating order (GOING SHORT, closing long): {e}")
             self.position = -1
         elif self.data["position"].iloc[-1] == 0: 
             if self.position == -1:
-                order = self.create_order(self.instrument, self.units, suppress = True, ret = True) 
-                self.report_trade(order, "GOING NEUTRAL")
+                try:
+                    order = self.create_order(self.instrument, self.units, suppress = True, ret = True) 
+                    self.report_trade(order, "GOING NEUTRAL")
+                except Exception as e:
+                    print(f"Error creating order (GOING NEUTRAL, closing short): {e}")
             elif self.position == 1:
-                order = self.create_order(self.instrument, -self.units, suppress = True, ret = True)
-                self.report_trade(order, "GOING NEUTRAL")
+                try:
+                    order = self.create_order(self.instrument, -self.units, suppress = True, ret = True)
+                    self.report_trade(order, "GOING NEUTRAL")
+                except Exception as e:
+                    print(f"Error creating order (GOING NEUTRAL, closing long): {e}")
             self.position = 0
     
     def report_trade(self, order, going):
@@ -136,98 +168,63 @@ class DNNTrader(tpqoa.tpqoa):
         pl = float(order["pl"])
         self.profits.append(pl)
         cumpl = sum(self.profits)
-        print("\n" + 100* "-")
-        print("{} | {}".format(time, going))
-        print("{} | units = {} | price = {} | P&L = {} | Cum P&L = {}".format(time, units, price, pl, cumpl))
-        print(100 * "-" + "\n")  
+        logging.info("\n" + 100* "-")
+        logging.info("{} | {}".format(time, going))
+        logging.info("{} | units = {} | price = {} | P&L = {} | Cum P&L = {}".format(time, units, price, pl, cumpl))
+        logging.info(100 * "-" + "\n")  
 
 if __name__ == "__main__":
-
-
-    # --- Load Trained Model and Parameters ---
-    MODEL_PATH = 'dnn_model.keras' # Keras format
-    MU_PATH = "mu.pkl"
-    STD_PATH = "std.pkl"
-    COLS_PATH = "cols.pkl" # Path to the saved feature columns list
-
-    print(f"Loading model from {MODEL_PATH}...")
+    # --- Load Trained Model and Parameters from config file ---
+    logging.info(f"Loading model from {config.MODEL_PATH}...")
     try:
-        model = tf.keras.models.load_model(MODEL_PATH)
-        print("Model loaded successfully.")
+        model = tf.keras.models.load_model(config.MODEL_PATH)
+        logging.info("Model loaded successfully.")
         
-        print(f"Loading normalization parameters from {MU_PATH} and {STD_PATH}...")
-        mu = pd.read_pickle(MU_PATH)
-        std = pd.read_pickle(STD_PATH)
-        print("Normalization parameters loaded successfully.")
+        logging.info(f"Loading normalization parameters from {config.MU_PATH} and {config.STD_PATH}...")
+        mu = pd.read_pickle(config.MU_PATH)
+        std = pd.read_pickle(config.STD_PATH)
+        logging.info("Normalization parameters loaded successfully.")
 
-        print(f"Loading feature columns from {COLS_PATH}...")
-        with open(COLS_PATH, 'rb') as f:
+        logging.info(f"Loading feature columns from {config.COLS_PATH}...")
+        with open(config.COLS_PATH, 'rb') as f:
             trained_cols = pickle.load(f)
-        print("Feature columns loaded successfully.")
+        logging.info("Feature columns loaded successfully.")
 
     except FileNotFoundError as e:
-        print(f"Error: Could not find one or more required files: {e}")
-        print("Please ensure 'dnn_model.keras', 'mu.pkl', 'std.pkl', and 'cols.pkl' exist.")
-        print("Run the 'train_dnn_model.py' script first to generate these files.")
+        logging.error(f"Error: Could not find one or more required files: {e}")
+        logging.error("Please ensure the paths in 'config.py' are correct and the files exist.")
+        logging.error("You may need to run a training script to generate these files.")
         exit()
     except Exception as e:
-        print(f"An error occurred while loading model/parameters: {e}")
+        logging.error(f"An error occurred while loading model/parameters: {e}")
         exit()
     
-    # --- Initialize and Run Trader ---
-    # Parameters for DNNTrader (should match training where applicable)
-    instrument = "EUR_USD" 
-    bar_length_trader = "20min" 
-    window_trader = 50
-    lags_trader = 5
-    units_trader = 100000
-
-    # # Check if trader parameters match training parameters (for critical ones)
-    # # This is a sanity check. The loaded mu, std, cols implicitly define what the model expects.
-    # if bar_length != bar_length_trader or WINDOW != window_trader or LAGS != lags_trader:
-    #     print("Warning: Trader parameters (bar_length, window, lags) differ from training script defaults.")
-    #     print("Ensure these are consistent if critical for feature generation.")
-    #     # Note: The loaded 'mu', 'std', and 'cols' are derived from the training script's parameters.
-    #     # The trader's 'define_strategy' must generate features compatible with these.
-
-    trader = DNNTrader(conf_file="oanda.cfg", 
-                       instrument=instrument, 
-                       bar_length=bar_length_trader, 
-                       window=window_trader, # Used in feature calculation
-                       lags=lags_trader,     # Used in feature calculation
+    # --- Initialize and Run Trader using parameters from config file ---
+    trader = DNNTrader(conf_file=config.OANDA_CONF_FILE, 
+                       instrument=config.INSTRUMENT, 
+                       bar_length=config.BAR_LENGTH_TRADER, 
+                       window=config.WINDOW_TRADER,
+                       lags=config.LAGS_TRADER,
                        model=model, 
                        mu=mu, 
                        std=std, 
-                       units=units_trader)
+                       units=config.UNITS_TRADER,
+                       trained_cols=trained_cols,
+                       prob_threshold_lower=config.PROB_THRESHOLD_LOWER,
+                       prob_threshold_upper=config.PROB_THRESHOLD_UPPER)
 
-    # Important: The DNNTrader.define_strategy() method dynamically creates `self.cols`.
-    # We must ensure that the columns it generates and uses for prediction (`df_s[self.cols]`)
-    # are *exactly* the same (name and order) as `trained_cols` used for training the model.
-    # The current `prepare_features` in the training script and `define_strategy` in DNNTrader
-    # seem to generate columns in the same way. If they differ, predictions will be meaningless.
-    # For robustness, one might pass `trained_cols` to DNNTrader or modify `define_strategy`
-    # to use `trained_cols` directly, but for now, we rely on consistent generation logic.
-    # A quick check:
-    # trader.define_strategy() # This would run it once to populate self.cols if needed for a check
-    # if trader.cols != trained_cols:
-    #    print("CRITICAL ERROR: Column mismatch between training and trader. Predictions will be incorrect.")
-    #    exit()
-    # This check is complex to do here without data. Relies on code inspection.
-
-    print("Fetching most recent data to initialize trader...")
-    # Get enough data for feature calculation (max(window, 150) + lags bars)
-    # 150 bars * 20 min/bar = 3000 mins = 50 hours = ~2.1 days. Add lags.
-    # So, 10 days should be plenty.
+    logging.info("Fetching most recent data to initialize trader...")
     trader.get_most_recent(days=10) 
     
-    print("Starting live trading stream (example: 100 ticks then stop)...")
+    logging.info("Starting live trading stream...")
     try:
-        # Stream for a limited number of ticks for testing, or use a time-based stop
-        trader.stream_data(trader.instrument, stop=100) # Example: stop after 100 ticks
-        # For continuous trading, you might remove 'stop' or use a different stopping condition.
+        # Stream data for the specified instrument.
+        # For continuous trading, this can be run without a 'stop' condition.
+        # For testing, you might add a stop condition, e.g., trader.stream_data(trader.instrument, stop=100)
+        trader.stream_data(trader.instrument)
     except KeyboardInterrupt:
-        print("\nTrading stopped by user (KeyboardInterrupt).")
+        logging.info("\nTrading stopped by user (KeyboardInterrupt).")
     finally:
-        print("Closing out any open positions...")
-        trader.close_out() # Ensure to close open positions
-        print("Trading session ended.")
+        logging.info("Closing out any open positions...")
+        trader.close_out()
+        logging.info("Trading session ended.")

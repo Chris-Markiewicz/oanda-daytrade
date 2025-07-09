@@ -5,6 +5,8 @@
 # Train the DNN model using functions from DNNModel.py.
 # Save the trained model, mu (mean), std (standard deviation) of features, and the list of feature columns.
 
+print("--- Starting DNN Model Training Script ---")
+
 import pandas as pd
 import numpy as np
 import tpqoa
@@ -23,7 +25,7 @@ INSTRUMENT = "EUR_USD"
 BAR_LENGTH = "20min"   # Must match DNNTrader's bar_length
 WINDOW = 50            # Must match DNNTrader's window
 LAGS = 5               # Must match DNNTrader's lags
-DATA_DAYS = 365 * 3    # How many days of historical data to fetch for training (e.g., 3 years)
+DATA_DAYS = 365  # How many days of historical data to fetch for training (e.g., 3 years)
 
 # Model Hyperparameters (can be tuned)
 HIDDEN_LAYERS = 2
@@ -80,6 +82,7 @@ def prepare_features(df, instrument_col, window_val, lags_val):
 if __name__ == "__main__":
     set_seeds()  # For reproducibility
 
+    print("\n[1/7] Loading Data...")
     # 1. Load Data
     api = tpqoa.tpqoa(CONF_FILE)
     
@@ -96,6 +99,7 @@ if __name__ == "__main__":
         exit()
     print(f"Initial raw data shape: {raw_data.shape}")
 
+    print("\n[2/7] Preparing Features...")
     # 2. Prepare Features
     print("Preparing features...")
     featured_data, feature_columns = prepare_features(raw_data, INSTRUMENT, WINDOW, LAGS)
@@ -107,6 +111,7 @@ if __name__ == "__main__":
     print(f"Data shape after feature engineering: {featured_data.shape}")
     # print(f"Feature columns: {feature_columns}")
 
+    print("\n[3/7] Defining Target and Splitting Data...")
     # 3. Define Target and Split Data (Chronological for Time Series)
     # Target: predict the direction of the *next* bar.
     featured_data["target"] = featured_data["dir"].shift(-1) # 'dir' of current bar is based on current bar's return
@@ -137,6 +142,7 @@ if __name__ == "__main__":
         print("One of the data splits is empty. Need more data or adjust split ratios. Exiting.")
         exit()
 
+    print("\n[4/7] Normalizing Data (Standardization)...")
     # 4. Normalize Data (Standardization)
     print("Normalizing data (calculating mu and std from training set)...")
     mu = X_train.mean()
@@ -149,6 +155,7 @@ if __name__ == "__main__":
     X_val_s = (X_val - mu) / std
     X_test_s = (X_test - mu) / std
 
+    print("\n[5/7] Creating and Training Model...")
     # 5. Create and Train Model
     print("Creating and training DNN model...")
     
@@ -186,6 +193,7 @@ if __name__ == "__main__":
     print("Loading best model from checkpoint (dnn_model.keras)...")
     best_model = tf.keras.models.load_model('dnn_model.keras')
 
+    print("\n[6/7] Evaluating Model on Test Set...")
     # 6. Evaluate Model on Test Set
     print("Evaluating model on the test set...")
     loss, accuracy = best_model.evaluate(X_test_s, y_test, verbose=0)
@@ -198,6 +206,7 @@ if __name__ == "__main__":
     # Use zero_division=0 to handle cases where a class might not be predicted or present in y_test_binary
     print(classification_report(y_test, y_pred_binary, target_names=['Down (0)', 'Up (1)'], zero_division=0))
 
+    print("\n[7/7] Saving Normalization Parameters and Feature Columns...")
     # 7. Save Normalization Parameters (mu, std) and Feature Columns
     print("Saving normalization parameters (mu.pkl, std.pkl) and feature columns (cols.pkl)...")
     mu.to_pickle("mu.pkl")
@@ -211,3 +220,5 @@ if __name__ == "__main__":
     print("Normalization std saved as: std.pkl")
     print("Feature column list saved as: cols.pkl")
     print("These files are required by DNNTrader.py.")
+
+print("--- DNN Model Training Script Finished ---")
