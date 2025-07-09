@@ -37,7 +37,7 @@ class DNNTrader(tpqoa.tpqoa):
     def get_most_recent(self, days = 10):
         while True:
             time.sleep(2)
-            now = datetime.now(timezone.utc)
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
             now = now - timedelta(microseconds = now.microsecond)
             past = now - timedelta(days = days)
             df = self.get_history(instrument = self.instrument, start = past, end = now,

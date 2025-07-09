@@ -34,9 +34,9 @@ class IterativeBase():
   def get_data(self):
     ''' Imports the data from detailed.csv (source can be changed).
     '''
-    raw = pd.read_csv("detailed.csv", parse_dates = ["time"], index_col = "time").dropna()
+    raw = pd.read_csv("DNN_data.csv", parse_dates = ["time"], index_col = "time").dropna()
     raw = raw.loc[self.start:self.end]
-    raw["returns"] = np.log(raw.price / raw.price.shift(1))
+    raw["returns"] = np.log(raw[self.symbol] / raw[self.symbol].shift(1))
     self.data = raw
 
   def plot_data(self, cols = None):
@@ -50,7 +50,7 @@ class IterativeBase():
     ''' Returns the date, the price and the spread for the given bar.
     '''
     date = str(self.data.index[bar].date())
-    price = round(self.data.price.iloc[bar], 5)
+    price = round(self.data[self.symbol].iloc[bar], 5)
     spread = round(self.data.spread.iloc[bar], 5)
     return date, price, spread
   

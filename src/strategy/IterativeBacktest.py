@@ -1,3 +1,10 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import tensorflow as tf
+import pickle
+import seaborn as sns # Added for heatmap visualization
+import os
 from IterativeBase import *
 
 
@@ -64,7 +71,7 @@ class IterativeBacktest(IterativeBase):
         if self.position in [0, 1]:
           self.go_short(bar, amount = "all") # go short with full amount
           self.position = -1 #short position
-    self.close_position(bar+1) # close postion at the last bar
+    self.close_position(bar+1)
 
   def test_contrarian_strategy(self, window = 1):
     '''
@@ -161,3 +168,7 @@ class IterativeBacktest(IterativeBase):
             self.position = 0
     self.close_position(bar+1)
 
+
+
+
+    
